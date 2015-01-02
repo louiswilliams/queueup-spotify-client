@@ -1,108 +1,125 @@
 var spotify = require('node-spotify')({ appkeyFile: 'spotify_appkey.key' });
 var request = require('request')
+var io = require('socket.io-client');
 var fs = require('fs')
-
-var serverUrl = "http://queueup.louiswilliams.org";
-var streamKey = fs.readFileSync('./streamKey.key', {encoding: 'utf8'}).trim();
+var loudness = require('loudness');
 
 var lastUpdate;
 var currentTrack;
 var queue;
 
-// Gets the status of the playlist from the server
-// Calls upon "update" to parse the JSON received
-// Calls back with the update data for the response
-function getStatus(callback) {
-  var url = serverUrl + "/client/" + streamKey + "/stream";
-  request(url, function(err, response, body) {
-    if (!err) {
-      var bodyJSON;
-      try {
-        bodyJSON = JSON.parse(body);
-      } catch (e) {
-        console.log("Problem: Response not valid JSON", e);
-      }
-      if (bodyJSON) {
-        update(bodyJSON, callback);
-      } else {
-        callback();
-      }
+var streamKey = fs.readFileSync('./streamKey.key', {encoding: 'utf8'}).trim();
+var username = fs.readFileSync('./user.key', {encoding: 'utf8'}).trim();
+var password = fs.readFileSync('./pass.key', {encoding: 'utf8'}).trim();
+var serverUrl = "http://queueup.louiswilliams.org";
+
+var auth_success = false;
+var client = io.connect(serverUrl, {
+  "force new connection": true
+});
+/*
+  Handle socket authentication with the server.
+*/
+client.on('auth_request', function(data){
+  console.log("Received auth request...");
+
+  /* Send auth key */
+  client.emit('auth_send', {key: streamKey});
+});
+
+/* Auth successful */
+client.on('auth_success', function() {
+  console.log("Authentication success");
+  /* Listen for updates from the server */
+  var auth_success = true;
+  // clientListen(client);
+});
+
+/* Unsuccessful auth */
+client.on('auth_fail', function(err) {
+  console.log("Authentication failure: ", err);
+})
+
+/* Handle the server disconnecting */
+client.on('disconnect', function() {
+  console.log("Server disconnected...");
+});
+
+/* Handles a new play state sent to the client */
+client.on('state_change', function (state) {
+    console.log("Received new state from server: ", state);  
+    updateVolume(state.volume);
+    if (state.track) {
+      updateTrack(state.track.uri, function() {
+        /* The play state needs to be changed AFTER a new song is added */
+        updatePlaying(state.play);
+      });
+    }
+});
+
+/* 
+  Changes the play state. Accepts a boolean value that describes
+  if the player is playing or not
+*/
+function updatePlaying(play) {
+  if (play) {
+    /* If it was paused originally, resume */
+    spotify.player.resume();
+  } else {
+    console.log("Paused playback...");
+    spotify.player.pause();
+  }
+}
+
+/*
+  Changes the volume (loudness). Accepts an integer from 0 to 100.
+*/
+function updateVolume(volume) {
+  var vol_adj = 10 * Math.sqrt(Math.min(Math.abs(volume)), 100);
+  console.log("Loudness altered by ", volume - vol_adj);
+  loudness.setVolume(vol_adj, function(err) {
+    /* Because this library increases volume linearly,
+       project it to a logarithmic curve
+    */ 
+    if (err) {
+      console.log("Error setting the volume to " + vol_adj);
     } else {
-      console.log("Request error: " + err.message);
+      loudness.getVolume(function(err, vol) {
+        console.log("Volume set to " + vol);     
+      })
+    }
+  });
+}
+
+/* 
+  Changes the track if the passed url is different or nothing is playing
+*/
+function updateTrack(track_uri, callback) {
+
+  var track = spotify.createFromLink(track_uri);
+
+  // If the current song has changed or there was never a song playing
+  if (!currentTrack || track.link != currentTrack.link) {
+    // currentTrack = track;
+    if (track) {
+      loadObj(track, function(t) {
+        currentTrack = t;
+        play(t);
+        callback();
+      });
+    } else {
+      console.log("Bad spotify url: " + json.current);
       callback();
     }
-  });
+  } else {
+    callback();
+  }
+
 }
 
-// Parses the JSON response from the server and makes changes to the 
-// current play state and queue if necessary
-// Calls back with the response data
-function update(json, callback) {
-
-  if (!json) {
-    console.log("Json undefined...");
-    return callback();
-  }
-
-  var response = {
-    status: json.status,
-    current: currentTrack,
-    queue: queue
-  };
-
-  changePlayStatus(json.status);
-
-  // If there is new information
-
-  if (!lastUpdate || json.last_updated > lastUpdate.last_updated) {
-    console.log("New info");
-    console.log(json);
-
-    var track = spotify.createFromLink(json.current);
-    response.updated = true;
-
-    // If the current song has changed or there was never a song playing
-    if (!currentTrack || track.link != currentTrack.link) {
-      currentTrack = track;
-      response.current = track;
-      if (track) {
-        loadObj(track, function(t) {
-        currentTrack = t;
-          play(t);
-          changePlayStatus(json.status);
-        });
-      } else {
-        console.log("Bad spotify url: " + json.current);
-      }
-    }
-
-   // RIght now, have to update queue. Way to check if queue changed in constant time?
-   // Update queue
-   lastUpdate = json;
-  }
-
-  var newQueue = [];
-  createQueue(json.queue, newQueue, function(q) {
-    queue = q;
-    response.updated = true;
-  });
-
-  response.queue = queue;
-
-  
-  // Load album art
-  if (currentTrack && currentTrack.album && !currentTrack.artwork) {
-    loadObj(currentTrack.album, function(a) {
-      currentTrack.artwork = a.getCoverBase64();
-      response.current = currentTrack;
-      response.updated = true;
-    });
-  }
-  callback(response);
-}
 
 function start(callback){
-  spotify.login('louieaw','0408dell', false,false);  
+  spotify.login(username, password, false,false);  
   spotify.on({
     ready: function() {
       console.log("Spotify ready...");
@@ -113,18 +130,8 @@ function start(callback){
 
 // Helper function to play a song
 function play(track) {
-        console.log("Now Playing " + track.name + " by " + track.artists[0].name);
-        spotify.player.play(track);  
-}
-
-function changePlayStatus(status) {
-  if (status == "play") {
-    // If it was paused originally, resume
-    spotify.player.resume();
-  } else {
-    console.log("Paused playback...");
-    spotify.player.pause();
-  }
+  console.log("Now Playing " + track.name + " by " + track.artists[0].name);
+  spotify.player.play(track);  
 }
 
 // Loads the track and calls back when ready
@@ -179,18 +186,10 @@ function process(fns) {
 
 // POST to the server to let it know the track has finished
 spotify.player.on({endOfTrack: function() {
-  var url = serverUrl + "/client/" + streamKey + "/ended";
-  request.post(url, function(err, response, body) {
-    if (!err) {
-      console.log("Ended track: ",body);
-    } else {
-      console.log("Error ending track",err);
-    }
-  });
+  client.emit('track_finished');
 }});
 
 
-
-exports.getStatus = getStatus;
+// exports.getStatus = getStatus;
 exports.start = start;
 
