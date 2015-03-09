@@ -24,7 +24,7 @@ client.on('auth_request', function(data){
   console.log("Received auth request...");
 
   /* Send auth key */
-  client.emit('auth_send', {key: streamKey});
+  client.emit('auth_send', {id: streamKey});
 });
 
 /* Auth successful */
